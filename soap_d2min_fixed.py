@@ -368,3 +368,181 @@ Xb, yb, _ = stack_target(te, lab_H, simple_feats)
 for j, nm in enumerate(["d5", "LSI", "q_tet", "n(r<3.5)"]):
     a = roc_auc_score(yb, Xb[:, j])
     print(f"{nm:9s} AUC = {max(a, 1 - a):.3f}  ({'high' if a > 0.5 else 'low'} value -> mobile)")
+
+# %% [markdown]
+# ## Round 3: same frames for every target, and less noisy targets
+#
+# Notes on the round-2 output:
+# * The H comparison above is NOT fair: with the frame-block split each H was tested on
+#   different frames (H=50 only on frames 390-429, H=80 trained on 280-319 and tested on
+#   480-519). Below, train and test are separated in SPACE instead (two slabs of the box
+#   with a ~9 A buffer), so every frame is used and every target is scored on the same frames.
+# * Neighbouring D2min windows share one frame ([f, f+10] and [f+10, f+20] both use f+10),
+#   so thermal noise in that frame inflates the 0.216 persistence. Windows 20 frames apart
+#   give 0.056. Likewise SOAP(f) and D2min[f, f+10] share frame f. So every target below
+#   starts at f + dp: nothing is shared between the input structure and the label.
+# * Targets compared:
+#     1. D2min[f+dp, f+2dp]                       (single window)
+#     2. cumulative D2min over H after f+dp        (time-averaged)
+#     3. coarse-grained D2min (averaged over the 3.5 A neighbourhood)  (space-averaged)
+#     4. LDA -> HDA conversion: an LDA-like molecule at f (large d5) becomes HDA-like (small d5)
+#        by f+H. This is closest to "will this region change", and it is irreversible,
+#        so it should be much less noisy than D2min.
+
+# %%
+# ---------------- per-frame geometry: slab coordinate, raw d5, neighbour pairs ----------------
+from scipy.spatial import cKDTree
+
+frac_x, d5_raw, nbr_pairs = {}, {}, {}
+for f in np.unique(soap_frame_of_row):
+    at = averaged_atoms(int(f), time_avg_half_width)
+    L = at.cell.lengths()[0]
+    pos = at.positions % L
+    pos[pos >= L] = 0.0
+    tree = cKDTree(pos, boxsize=L)
+    dist, _ = tree.query(pos, k=6)
+    d5_raw[int(f)] = dist[:, 5].astype(np.float32)          # column 0 is the molecule itself
+    frac_x[int(f)] = pos[:, 0] / L
+    nbr_pairs[int(f)] = tree.query_pairs(coarse_grain_shell, output_type="ndarray")
+
+for f in [250, 400, 550, 650]:
+    if f in d5_raw:
+        q = np.percentile(d5_raw[f], [10, 50, 90])
+        print(f"frame {f}: d5 10/50/90 percentiles = {q.round(2)}")
+
+# %%
+# ---------------- spatial-split evaluation ----------------
+TRAIN_SLAB = (0.05, 0.35)     # fractional x; the gaps 0.35-0.55 and 0.85-1.05 are buffers
+TEST_SLAB = (0.55, 0.85)
+
+
+def cg_row(vals, pairs):
+    s = vals.astype(float).copy()
+    c = np.ones_like(s)
+    np.add.at(s, pairs[:, 0], vals[pairs[:, 1]])
+    np.add.at(s, pairs[:, 1], vals[pairs[:, 0]])
+    np.add.at(c, pairs[:, 0], 1)
+    np.add.at(c, pairs[:, 1], 1)
+    return s / c
+
+
+def eval_target(get_label, name, stride=2, show=True):
+    """get_label(k) -> labels (-1/0/1) for all molecules, or None if undefined for row k."""
+    Xa, ya, Xb, yb, fb = [], [], [], [], []
+    for n_, k in enumerate(range(0, n_rows, stride)):
+        lab = get_label(k)
+        if lab is None:
+            continue
+        f = int(soap_frame_of_row[k])
+        x = frac_x[f]
+        tr = (lab != -1) & (x >= TRAIN_SLAB[0]) & (x < TRAIN_SLAB[1])
+        te = (lab != -1) & (x >= TEST_SLAB[0]) & (x < TEST_SLAB[1])
+        if n_ % 2 == 0:
+            Xa.append(features[f][tr]); ya.append(lab[tr])
+        Xb.append(features[f][te]); yb.append(lab[te]); fb.append(np.full(te.sum(), k))
+    ya_all = np.concatenate(ya) if ya else np.array([])
+    if len(np.unique(ya_all)) < 2:
+        print(f"{name:38s} not enough labelled molecules of both classes")
+        return None
+    m = fit_balanced(make_hgb(), np.vstack(Xa), ya_all)
+    Xb, yb, fb = np.vstack(Xb), np.concatenate(yb), np.concatenate(fb)
+    p = m.predict_proba(Xb)[:, 1]
+    per = {}
+    for k in np.unique(fb):
+        s = fb == k
+        if 0 < yb[s].sum() < s.sum():
+            per[k] = roc_auc_score(yb[s], p[s])
+    mean_auc = np.mean(list(per.values()))
+    print(f"{name:38s} mean per-frame AUC = {mean_auc:.3f}   "
+          f"(frames {len(per)}, test molecules {len(yb)}, positives {yb.mean():.2f})")
+    if show:
+        ks = np.array(sorted(per))
+        plt.plot(row_frames[ks], [per[k] for k in ks], "o", ms=3, label=name)
+    return per
+
+
+def label_rows(rowvals):
+    return per_frame_labels(rowvals)
+
+
+plt.figure(figsize=(10, 4.5))
+res = {}
+
+# 1. single window, starting at f + dp
+res["D2min [f+dp, f+2dp]"] = eval_target(
+    lambda k: label_rows(d2min[k + dp]) if k + dp < n_rows else None, "D2min [f+dp, f+2dp]")
+
+# 2. cumulative over H after f + dp
+for H in [30, 50]:
+    T = cumulative_target(H)
+    res[f"cumulative H={H}"] = eval_target(
+        lambda k, T=T: label_rows(T[k + dp]) if k + dp < len(T) else None, f"cumulative D2min H={H}")
+
+# 3. coarse-grained single window and coarse-grained H=50
+res["CG D2min [f+dp, f+2dp]"] = eval_target(
+    lambda k: label_rows(cg_row(d2min[k + dp], nbr_pairs[int(row_frames[k + dp])]))
+    if k + dp < n_rows else None, "CG D2min [f+dp, f+2dp]")
+T50 = cumulative_target(50)
+res["CG cumulative H=50"] = eval_target(
+    lambda k: label_rows(cg_row(T50[k + dp], nbr_pairs[int(row_frames[k + dp])]))
+    if k + dp < len(T50) else None, "CG cumulative D2min H=50")
+
+plt.axhline(0.5, color="gray", ls="--")
+plt.xlabel("frame f (structure)")
+plt.ylabel("per-frame AUC (test slab)")
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# %%
+# persistence of each target (windows that share no frame): rank correlation between
+# the target starting at f and the same target starting at f + H + dp
+def persistence(rows_fn, gap):
+    vals = [spearmanr(rows_fn(k), rows_fn(k + gap))[0] for k in range(0, n_rows - gap - 60, 5)]
+    return np.mean(vals)
+
+print("raw D2min, 20 frames apart          :", round(persistence(lambda k: d2min[k], 2 * dp), 3))
+print("CG  D2min, 20 frames apart          :", round(persistence(
+    lambda k: cg_row(d2min[k], nbr_pairs[int(row_frames[k])]), 2 * dp), 3))
+print("cumulative H=50, 60 frames apart    :", round(persistence(lambda k: T50[k], 60), 3))
+print("CG cumulative H=50, 60 frames apart :", round(persistence(
+    lambda k: cg_row(T50[k], nbr_pairs[int(row_frames[k])]), 60), 3))
+
+# %%
+# ---------------- 4. LDA -> HDA conversion target ----------------
+# Eligible: LDA-like at f (d5 > d5_lda). Positive: HDA-like at f+H (d5 < d5_hda).
+# Check the d5 percentiles printed above and adjust the two thresholds if needed
+# (TIP4P/2005: LDA d5 roughly 3.5-4 A, HDA d5 roughly 3.0-3.3 A).
+d5_lda, d5_hda = 3.5, 3.3
+
+plt.figure(figsize=(10, 4.5))
+for H in [20, 50]:
+    def conv_label(k, H=H):
+        f, f2 = int(soap_frame_of_row[k]), int(soap_frame_of_row[k]) + H
+        if f2 not in d5_raw:
+            return None
+        lab = np.full(n_particles, -1)
+        elig = d5_raw[f] > d5_lda
+        lab[elig] = (d5_raw[f2][elig] < d5_hda).astype(int)
+        return lab
+    res[f"conversion H={H}"] = eval_target(conv_label, f"LDA->HDA conversion within H={H}")
+
+    # baseline: d5(f) alone on the same test molecules (larger d5 = further from HDA)
+    aucs = []
+    for k in range(0, n_rows, 2):
+        lab = conv_label(k)
+        if lab is None:
+            continue
+        f = int(soap_frame_of_row[k])
+        x = frac_x[f]
+        s = (lab != -1) & (x >= TEST_SLAB[0]) & (x < TEST_SLAB[1])
+        if 0 < lab[s].sum() < s.sum():
+            aucs.append(roc_auc_score(lab[s], -d5_raw[f][s]))
+    if aucs:
+        print(f"{'   baseline: d5(f) alone':38s} mean per-frame AUC = {np.mean(aucs):.3f}")
+plt.axhline(0.5, color="gray", ls="--")
+plt.xlabel("frame f (structure)")
+plt.ylabel("per-frame AUC (test slab)")
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
