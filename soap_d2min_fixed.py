@@ -237,3 +237,134 @@ for lag in [dp, 2 * dp, 5 * dp]:
     rho = np.mean([spearmanr(d2min[k], d2min[k + lag])[0]
                    for k in range(0, n_rows - lag, 5)])
     print(f"Spearman(D2min[f], D2min[f+{lag}]) averaged over frames = {rho:.3f}")
+
+# %% [markdown]
+# ## Next steps
+#
+# Results so far (conf1): pooled test AUC 0.61 (HGB) / 0.56 (LogReg), frame-only
+# baseline 0.50. Per-frame AUC is about 0.62-0.65 from frame 250 to 500, drops to
+# about 0.59 near frame 575 and about 0.52 near frame 660 (HDA, nothing left to predict).
+#
+# The limiting factor is the label, not SOAP: a molecule's D2min in one 10-frame
+# window has Spearman 0.22 with its D2min in the next window, and 0.06 two windows
+# later. A label that barely predicts itself cannot be predicted well from structure.
+#
+# The cells below (a) build a less noisy target, cumulative D2min over a longer
+# horizon H, and (b) compare SOAP with four simple local-structure descriptors.
+
+# %%
+# ---------------- (a) cumulative D2min over a longer horizon ----------------
+# target_H[k] = sum of the non-overlapping dp-windows that cover [f, f+H].
+# Summing several windows averages out the thermal part, which is uncorrelated
+# from window to window, while real rearrangements add up.
+def cumulative_target(H):
+    n_win = H // dp
+    n_ok = n_rows - (n_win - 1) * dp
+    return np.array([d2min[k:k + n_win * dp:dp].sum(axis=0) for k in range(n_ok)])
+
+
+def block_split(n_ok, gap, train_len=40):
+    # blocks: [gap | train_len usable | gap], alternate train / test
+    blen = train_len + 2 * gap
+    pos = np.arange(n_ok) % blen
+    blk = np.arange(n_ok) // blen
+    keep = (pos >= gap) & (pos < blen - gap)
+    return np.where(keep & (blk % 2 == 0))[0], np.where(keep & (blk % 2 == 1))[0]
+
+
+def stack_target(rows, lab_arr, feat=None):
+    feat = features if feat is None else feat
+    X, y, fr = [], [], []
+    for k in rows:
+        m = lab_arr[k] != -1
+        X.append(feat[int(soap_frame_of_row[k])][m])
+        y.append(lab_arr[k][m])
+        fr.append(np.full(m.sum(), k))
+    return np.vstack(X), np.concatenate(y), np.concatenate(fr)
+
+
+results_H = {}
+for H in [10, 30, 50, 80]:
+    T = cumulative_target(H)
+    # persistence of this target: rank correlation with the NEXT, non-overlapping horizon
+    pers = np.mean([spearmanr(T[k], T[k + H])[0] for k in range(0, len(T) - H, 5)])
+    lab_H = np.array([per_frame_labels(r) for r in T])
+    tr, te = block_split(len(T), gap=max(H, dp))
+    Xa, ya, _ = stack_target(tr, lab_H)
+    Xb, yb, fb = stack_target(te, lab_H)
+    m = fit_balanced(make_hgb(), Xa, ya)
+    pb = m.predict_proba(Xb)[:, 1]
+    results_H[H] = (pb, yb, fb)
+    print(f"H = {H:3d} frames: target persistence rho = {pers:.3f} | "
+          f"SOAP test AUC = {roc_auc_score(yb, pb):.3f}  "
+          f"(train frames {len(tr)}, test frames {len(te)})")
+
+# %%
+# per-frame AUC for the longest horizon
+H = max(results_H)
+pb, yb, fb = results_H[H]
+fu = np.unique(fb)
+plt.figure(figsize=(9, 4))
+plt.plot(row_frames[fu], [roc_auc_score(yb[fb == k], pb[fb == k]) for k in fu], "o", ms=3)
+plt.axhline(0.5, color="gray", ls="--")
+plt.xlabel("frame f")
+plt.ylabel("per-frame AUC")
+plt.title(f"HGB: SOAP(f) -> top {int(mobile_frac*100)}% cumulative D2min over [f, f+{H}]")
+plt.tight_layout()
+plt.show()
+
+# %%
+# ---------------- (b) simple descriptors: d5, LSI, q_tet, local density ----------------
+# If these do as well as SOAP, the signal is the familiar LDA/HDA one (interstitial
+# 5th neighbour). If neither beats ~0.6, the limit is the label noise.
+from scipy.spatial import cKDTree
+
+
+def simple_descriptors(atoms, lsi_cut=3.7, dens_cut=3.5, k=16):
+    L = atoms.cell.lengths()[0]
+    pos = atoms.positions % L
+    tree = cKDTree(pos, boxsize=L)
+    dist, idx = tree.query(pos, k=k + 1)
+    dist, idx = dist[:, 1:], idx[:, 1:]                     # drop self
+    d5 = dist[:, 4]
+    # LSI: variance of gaps between consecutive neighbour distances below lsi_cut
+    lsi = np.zeros(len(pos))
+    for i in range(len(pos)):
+        n = np.searchsorted(dist[i], lsi_cut)
+        gaps = np.diff(dist[i, :n + 1])
+        lsi[i] = gaps.var() if len(gaps) > 0 else 0.0
+    # q_tet from the 4 nearest neighbours
+    v = pos[idx[:, :4]] - pos[:, None, :]
+    v -= L * np.round(v / L)
+    v /= np.linalg.norm(v, axis=2, keepdims=True)
+    cos = np.einsum("nid,njd->nij", v, v)
+    iu = np.triu_indices(4, 1)
+    qtet = 1 - 3 / 8 * ((cos[:, iu[0], iu[1]] + 1 / 3) ** 2).sum(axis=1)
+    n_dens = (dist < dens_cut).sum(axis=1)
+    return np.column_stack([d5, lsi, qtet, n_dens]).astype(np.float32)
+
+
+simple_feats = {}
+for f in np.unique(soap_frame_of_row):
+    x = simple_descriptors(averaged_atoms(int(f), time_avg_half_width))
+    simple_feats[int(f)] = x - x.mean(axis=0)              # same per-frame centering
+
+for H in [10, max(results_H)]:
+    T = cumulative_target(H)
+    lab_H = np.array([per_frame_labels(r) for r in T])
+    tr, te = block_split(len(T), gap=max(H, dp))
+    for name, feat in [("SOAP", features), ("d5/LSI/qtet/n", simple_feats)]:
+        Xa, ya, _ = stack_target(tr, lab_H, feat)
+        Xb, yb, _ = stack_target(te, lab_H, feat)
+        m = fit_balanced(make_hgb(), Xa, ya)
+        print(f"H = {H:3d}  {name:14s} test AUC = {roc_auc_score(yb, m.predict_proba(Xb)[:, 1]):.3f}")
+
+# %%
+# single-descriptor AUCs (sign-free), pooled over test frames, H = 10
+T = cumulative_target(10)
+lab_H = np.array([per_frame_labels(r) for r in T])
+_, te = block_split(len(T), gap=dp)
+Xb, yb, _ = stack_target(te, lab_H, simple_feats)
+for j, nm in enumerate(["d5", "LSI", "q_tet", "n(r<3.5)"]):
+    a = roc_auc_score(yb, Xb[:, j])
+    print(f"{nm:9s} AUC = {max(a, 1 - a):.3f}  ({'high' if a > 0.5 else 'low'} value -> mobile)")
