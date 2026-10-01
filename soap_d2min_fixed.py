@@ -26,6 +26,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import roc_auc_score
+from sklearn.utils.class_weight import compute_sample_weight
 from scipy.stats import spearmanr
 
 # %%
@@ -172,15 +173,29 @@ print("train", X_tr.shape, y_tr.mean(), "| test", X_te.shape, y_te.mean())
 
 # %%
 # ---------------- models ----------------
+# Class balancing is done with sample weights so this works on any scikit-learn
+# version (HistGradientBoostingClassifier only got class_weight in 1.2).
+def make_hgb():
+    return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=0)
+
+
+def fit_balanced(model, X, y):
+    w = compute_sample_weight("balanced", y)
+    if hasattr(model, "steps"):                    # Pipeline: weight goes to the last step
+        model.fit(X, y, **{f"{model.steps[-1][0]}__sample_weight": w})
+    else:
+        model.fit(X, y, sample_weight=w)
+    return model
+
+
 models = {
     "LogReg (PCA 30)": make_pipeline(StandardScaler(), PCA(30),
-                                     LogisticRegression(max_iter=2000, class_weight="balanced")),
-    "HGB": HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05,
-                                          class_weight="balanced", random_state=0),
+                                     LogisticRegression(max_iter=2000)),
+    "HGB": make_hgb(),
 }
 proba = {}
 for name, m in models.items():
-    m.fit(X_tr, y_tr)
+    fit_balanced(m, X_tr, y_tr)
     proba[name] = m.predict_proba(X_te)[:, 1]
     print(f"{name:16s} pooled test AUC = {roc_auc_score(y_te, proba[name]):.3f}")
 
@@ -211,8 +226,7 @@ lags = [0, 10, 20, 40, 80]
 for lag in lags:
     Xa, ya, _ = stack(train_rows, lag)
     Xb, yb, _ = stack(test_rows, lag)
-    m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05,
-                                       class_weight="balanced", random_state=0).fit(Xa, ya)
+    m = fit_balanced(make_hgb(), Xa, ya)
     print(f"lag {lag:3d} frames: test AUC = {roc_auc_score(yb, m.predict_proba(Xb)[:, 1]):.3f}")
 
 # %%
