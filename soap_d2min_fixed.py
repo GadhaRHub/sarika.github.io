@@ -37,9 +37,10 @@ upper_frame_bound = 700
 d2min_file = f"/media/gadha/Googok/Sarika_Mohit_Project/nonaffine/d2min_delf_{dp}_scaled.dat"
 traj_dir = "/media/gadha/Googok/Sarika_Mohit_Project/data/"
 
-# CHECK THIS against your D2min code: does d2min row k describe the window
-# [f, f+dp] (reference = f) or [f-dp, f] (current = f), with f = lower_frame_bound + k?
-# For prediction, SOAP must come from the START of the window.
+# run_const_nn_to_sir.sh uses ref = f, current = f + dp, so row k is the window
+# [f, f+dp] with f = lower_frame_bound + k. SOAP must come from the START of the window.
+# Still verify that fort.(f+1000) is the same frame as .gro frame f (1-based) - no off-by-one.
+# Note: D2min is in reduced units (positions scaled by rho^(1/3)); 1 unit ~ 9.6 A^2.
 d2min_row_is_window_start = True
 
 use_real_box = True             # read the box from line 1 of each fort file
